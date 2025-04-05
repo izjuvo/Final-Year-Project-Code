@@ -1,0 +1,169 @@
+import numpy as np
+import pandas as pd
+import math
+import random, string
+
+# Machine Learning libraries
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.linear_model import LogisticRegression
+import joblib
+
+# Deep Learning libraries
+import tensorflow as tf
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras import layers, models
+from tensorflow.keras.layers import Dropout, Bidirectional
+
+# Set random seeds for reproducibility
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ------------------------------
+# 1. Load and Clean Dataset
+# ------------------------------
+df = pd.read_csv('dga_domains_full.csv', header=0)
+df.columns = ['label', 'source', 'domain']
+df = df.drop_duplicates()
+df['domain'] = df['domain'].str.lower()
+df['label'] = df['label'].map({'legit': 0, 'dga': 1})
+print("Dataset sample after cleaning:")
+print(df.head())
+
+# ------------------------------
+# 2. Feature Extraction
+# ------------------------------
+def calculate_entropy(domain):
+    prob = [float(domain.count(c)) / len(domain) for c in set(domain)]
+    return -sum(p * math.log(p, 2) for p in prob)
+
+df["domain_length"] = df["domain"].apply(len)
+df["entropy"] = df["domain"].apply(calculate_entropy)
+
+# TF-IDF features (character n-grams: 2 to 4)
+vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 4))
+tfidf_features = vectorizer.fit_transform(df["domain"])
+
+# ------------------------------
+# 3. Model Training (Base Models)
+# ------------------------------
+y = df["label"]
+
+# --- 3.1 Random Forest (hand-crafted features) ---
+X_handcrafted = df[["domain_length", "entropy"]]
+X_train_hc, X_test_hc, y_train, y_test = train_test_split(X_handcrafted, y, test_size=0.3, random_state=42)
+rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_clf.fit(X_train_hc, y_train)
+y_pred_rf = rf_clf.predict(X_test_hc)
+print("\nRandom Forest Classification Report:")
+print(classification_report(y_test, y_pred_rf))
+joblib.dump(rf_clf, 'rf_model.pkl')
+
+# --- 3.2 SVM (TF-IDF features) ---
+X_train_tfidf, X_test_tfidf, y_train, y_test = train_test_split(tfidf_features, y, test_size=0.3, random_state=42)
+svm_clf = SVC(kernel='linear', probability=True, random_state=42)
+svm_clf.fit(X_train_tfidf, y_train)
+y_pred_svm = svm_clf.predict(X_test_tfidf)
+print("\nSVM Classification Report:")
+print(classification_report(y_test, y_pred_svm))
+joblib.dump(svm_clf, 'svm_model.pkl')
+
+# --- 3.3 Improved RNN (character-level sequences) ---
+tokenizer = Tokenizer(char_level=True)
+tokenizer.fit_on_texts(df["domain"])
+sequences = tokenizer.texts_to_sequences(df["domain"])
+max_length = max(len(seq) for seq in sequences)
+padded_sequences = pad_sequences(sequences, maxlen=max_length, padding='post')
+
+X_train_seq, X_test_seq, y_train, y_test = train_test_split(padded_sequences, y, test_size=0.3, random_state=42)
+vocab_size = len(tokenizer.word_index) + 1
+embedding_dim = 32
+
+# Improved RNN with Bidirectional LSTM and Dropout layers
+rnn_model = models.Sequential([
+    layers.Embedding(input_dim=vocab_size, output_dim=embedding_dim, input_length=max_length),
+    Bidirectional(layers.LSTM(64, return_sequences=True)),
+    Dropout(0.5),
+    layers.LSTM(32),
+    Dropout(0.5),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+rnn_model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+rnn_model.summary()
+
+# Train for more epochs and a larger batch size
+rnn_model.fit(X_train_seq, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
+rnn_loss, rnn_acc = rnn_model.evaluate(X_test_seq, y_test, verbose=0)
+print("\nImproved RNN Model Accuracy on Test Set: {:.2f}%".format(rnn_acc * 100))
+rnn_model.save('improved_rnn_model.h5')
+
+# ------------------------------
+# 4. Stacking Ensemble
+# ------------------------------
+# Generate meta features from training set
+rf_train_prob = rf_clf.predict_proba(X_train_hc)[:, 1]
+svm_train_prob = svm_clf.predict_proba(X_train_tfidf)[:, 1]
+rnn_train_prob = rnn_model.predict(X_train_seq).flatten()
+X_meta_train = np.column_stack((rf_train_prob, svm_train_prob, rnn_train_prob))
+
+# Generate meta features from test set
+rf_test_prob = rf_clf.predict_proba(X_test_hc)[:, 1]
+svm_test_prob = svm_clf.predict_proba(X_test_tfidf)[:, 1]
+rnn_test_prob = rnn_model.predict(X_test_seq).flatten()
+X_meta_test = np.column_stack((rf_test_prob, svm_test_prob, rnn_test_prob))
+
+meta_clf = LogisticRegression(random_state=42)
+meta_clf.fit(X_meta_train, y_train)
+meta_test_pred = meta_clf.predict(X_meta_test)
+print("\nStacking Ensemble Logistic Regression Classification Report:")
+print(classification_report(y_test, meta_test_pred))
+joblib.dump(meta_clf, 'meta_model.pkl')
+
+# ------------------------------
+# 5. Real-Time Prediction Function with Stacking
+# ------------------------------
+def predict_domain_stacked(domain):
+    # Random Forest: hand-crafted features
+    length = len(domain)
+    ent = calculate_entropy(domain)
+    handcrafted_features = pd.DataFrame([[length, ent]], columns=['domain_length', 'entropy'])
+    rf_prob = rf_clf.predict_proba(handcrafted_features)[:, 1][0]
+
+    # SVM: TF-IDF features
+    tfidf_vec = vectorizer.transform([domain])
+    svm_prob = svm_clf.predict_proba(tfidf_vec)[:, 1][0]
+
+    # Improved RNN: sequence model
+    seq = tokenizer.texts_to_sequences([domain])
+    padded_seq = pad_sequences(seq, maxlen=max_length, padding='post')
+    rnn_prob = rnn_model.predict(padded_seq)[0][0]
+
+    # Stack probabilities and predict with meta-model
+    X_meta = np.array([[rf_prob, svm_prob, rnn_prob]])
+    meta_pred = meta_clf.predict(X_meta)[0]
+    meta_prob = meta_clf.predict_proba(X_meta)[0][1]
+
+    return {
+        "Stacked_Prediction": "DGA-generated" if meta_pred == 1 else "benign",
+        "Meta_Probability": meta_prob,
+        "Base_Probabilities": {
+            "RandomForest": rf_prob,
+            "SVM": svm_prob,
+            "RNN": rnn_prob
+        }
+    }
+
+# ------------------------------
+# 6. Testing Real-Time Stacked Predictions
+# ------------------------------
+test_domains = ["example.com", "abcxyz123.com", "securebank.com", "lkjhgfd.com"]
+print("\nReal-Time Stacked Domain Predictions:")
+for domain in test_domains:
+    preds = predict_domain_stacked(domain)
+    print(f"Domain: {domain:20s} -> {preds}")
